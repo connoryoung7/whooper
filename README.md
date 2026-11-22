@@ -56,45 +56,83 @@ Keep the client ID and secret for step 2.
 
 ## 2. Deploy on Dokploy
 
-1. **Database:** create a Postgres database in your Dokploy project. From its
-   *Internal Credentials*, copy the **Internal Connection URL**. Turn on scheduled
-   **backups** for it, since this is your copy of the data.
-2. **Application:** create an Application from this repository.
-   - Build type **Dockerfile**, Dockerfile path `Dockerfile`, context `.`
-   - **Environment:**
-     ```
-     DATABASE_URL=<internal connection URL>
-     WHOOP_CLIENT_ID=...
-     WHOOP_CLIENT_SECRET=...
-     WHOOP_REDIRECT_URL=https://<your-domain>/auth/callback
-     ADMIN_PASSWORD=<long random string>
-     PORT=8080
-     ```
-   - **Domains:** add `<your-domain>`, container port `8080`, HTTPS on, certificate
-     Let's Encrypt.
-   - Deploy. The image has a `HEALTHCHECK` on `/health`.
-3. **Connect WHOOP:** open `https://<your-domain>/auth/login`. Your browser will ask for a
-   username and password: use any username and `ADMIN_PASSWORD`. Approve access on WHOOP.
-   The callback stores the token and starts the first full download in the background.
-   That download takes a few minutes, because requests are throttled to about 92 a minute
-   to stay under WHOOP's limit of 100.
-4. **Schedules:** in the application's **Schedules** tab, add *Application* jobs. Dokploy
-   runs these with `docker exec` inside the running container:
+The app runs as one long-lived container (`whooper serve`). It handles the one-time WHOOP
+login and serves `/status`. Dokploy schedules run `whooper sync` inside that same
+container. The database is a Dokploy-managed Postgres in the same project.
 
-   | Name | Cron | Command |
-   | --- | --- | --- |
-   | WHOOP sync | `0 * * * *` | `whooper sync` |
-   | WHOOP full reconcile | `30 3 * * *` | `whooper sync --full` |
+### Database
 
-   Each run's log ends with the completeness report, and the exit code is non-zero if the
-   sync failed. API usage is roughly 5–10 requests per hourly run and about 60 per year of
-   history per full run, well under WHOOP's 10,000/day.
-5. **Check it:** open `https://<your-domain>/status` (JSON), or run
-   `whooper status` from the Dokploy terminal or as a schedule.
+1. In your Dokploy project, create a **PostgreSQL** database and deploy it.
+2. Under *Internal Credentials*, copy the **Internal Connection URL**. It looks like
+   `postgresql://<user>:<password>@<db-app-name>:5432/<database>` and can be used as-is.
+3. Turn on **backups** (this needs an S3 destination configured in Dokploy). The WHOOP data
+   can be downloaded again, but your body-measurement history and the WHOOP token exist
+   only in this database.
 
-If the report says the refresh token was rejected (for example, you revoked access in the
-WHOOP app), visit `/auth/login` again. A deployment refuses to connect a different WHOOP
-user than the one whose data it already holds.
+### Application
+
+1. Create an **Application** in the same project.
+2. **Source:** the repository is public, so use the **Git** provider with
+   `https://github.com/connoryoung7/whooper.git`, branch `main`, and no credentials. Use the
+   **GitHub** provider instead if you want Dokploy to redeploy on every push.
+3. **Build type:** **Dockerfile**, Dockerfile path `Dockerfile`, Docker context path `.`
+4. **Environment:**
+   ```
+   DATABASE_URL=<internal connection URL from above>
+   WHOOP_CLIENT_ID=<from the WHOOP developer app>
+   WHOOP_CLIENT_SECRET=<from the WHOOP developer app>
+   WHOOP_REDIRECT_URL=https://<your-domain>/auth/callback
+   ADMIN_PASSWORD=<long random string>
+   ```
+   Optional: `PORT` (default `8080`) and `SYNC_LOOKBACK_DAYS` (default `14`).
+5. **Domains:** add `<your-domain>` with container port **8080**, HTTPS on, and the
+   Let's Encrypt certificate. The domain's DNS must point at your Dokploy server.
+6. **Deploy.** The logs should show `applied migration 00001_initial_schema.sql`, then
+   `listening on :8080`. The image's `HEALTHCHECK` polls `/health`.
+
+### Connect WHOOP
+
+Open `https://<your-domain>/auth/login`. When the browser asks for a username and
+password, enter any username and `ADMIN_PASSWORD`. Approve access on WHOOP.
+
+The callback stores the token and starts the first full download in the background. It
+takes a few minutes, because requests are throttled to about 92 a minute to stay under
+WHOOP's limit of 100. Watch progress at `/status`.
+
+### Schedules
+
+In the application's **Schedules** tab, add two **Application** schedules:
+
+| Name | Cron | Command |
+| --- | --- | --- |
+| WHOOP sync | `0 * * * *` | `whooper sync` |
+| WHOOP full reconcile | `30 3 * * *` | `whooper sync --full` |
+
+Dokploy runs each one as `docker exec <container> bash -c "<command>"`. The default
+**Bash** shell type works, because the image includes bash (`sh` works too). Set a
+timezone if you want the cron times to be local rather than the server's.
+
+Each run's log ends with the completeness report. A failed sync exits non-zero, so Dokploy
+marks that run as failed. API usage is roughly 5–10 requests per hourly run and about 60
+per year of history per full run, well under WHOOP's 10,000 a day.
+
+### Check it
+
+After the first full download, `https://<your-domain>/status` should report
+`"complete": true`. `whooper status` prints the same report from the Dokploy terminal and
+exits 1 if anything is missing. You can also add it as a daily schedule.
+
+### Troubleshooting
+
+- **The callback fails after approving on WHOOP:** the application logs show the error
+  WHOOP returned. The usual cause is a `WHOOP_REDIRECT_URL` that doesn't exactly match the
+  redirect URL registered on the WHOOP app (scheme, domain and path).
+- **"refresh token was rejected":** WHOOP no longer accepts the stored token, for example
+  because you revoked access in the WHOOP app. Visit `/auth/login` again.
+- **Connecting a different WHOOP account:** the server refuses with HTTP 409. One
+  deployment mirrors one WHOOP user and won't mix another user's data into it.
+- **The build fails with `go.mod requires go >= …`:** a dependency update raised the Go
+  version in `go.mod`. Raise the `golang:` image tag in the `Dockerfile` to match.
 
 ## Local development
 
