@@ -7,11 +7,19 @@ build:
 	@echo "Building..."
 	
 	
-	@go build -o main cmd/api/main.go
+	@go build -o main ./cmd/whooper
 
-# Run the application
+# Run the web server
 run:
-	@go run cmd/api/main.go
+	@go run ./cmd/whooper serve
+
+# Sync WHOOP data once (FULL=1 re-downloads the whole history)
+sync:
+	@go run ./cmd/whooper sync $(if $(FULL),--full)
+
+# Print the data completeness report
+status:
+	@go run ./cmd/whooper status
 # Create DB container
 docker-run:
 	@if docker compose up --build 2>/dev/null; then \
@@ -37,7 +45,7 @@ test:
 # Integrations Tests for the application
 itest:
 	@echo "Running integration tests..."
-	@go test ./internal/database -v
+	@go test ./internal/database ./internal/syncer ./internal/server -v
 
 # Clean the binary
 clean:
@@ -61,4 +69,4 @@ watch:
             fi; \
         fi
 
-.PHONY: all build run test clean watch docker-run docker-down itest
+.PHONY: all build run sync status test clean watch docker-run docker-down itest

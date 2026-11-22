@@ -1,115 +1,118 @@
+// Package database stores the WHOOP mirror in Postgres.
 package database
 
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	_ "embed"
 	"fmt"
-	"log"
-	"os"
 	"strconv"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	_ "github.com/joho/godotenv/autoload"
 )
 
-// Service represents a service that interacts with a database.
-type Service interface {
-	// Health returns a map of health status information.
-	// The keys and values in the map are service-specific.
-	Health() map[string]string
+//go:embed schema.sql
+var schema string
 
-	// Close terminates the database connection.
-	// It returns an error if the connection cannot be closed.
-	Close() error
-}
-
-type service struct {
-	db *sql.DB
-}
-
-var (
-	database   = os.Getenv("BLUEPRINT_DB_DATABASE")
-	password   = os.Getenv("BLUEPRINT_DB_PASSWORD")
-	username   = os.Getenv("BLUEPRINT_DB_USERNAME")
-	port       = os.Getenv("BLUEPRINT_DB_PORT")
-	host       = os.Getenv("BLUEPRINT_DB_HOST")
-	schema     = os.Getenv("BLUEPRINT_DB_SCHEMA")
-	dbInstance *service
+// Advisory lock keys. The values are arbitrary but fixed so every process agrees on them.
+const (
+	migrateLock int64 = 7_305_942_001
+	// SyncLock is held for a whole sync run so scheduled runs never overlap.
+	SyncLock int64 = 7_305_942_002
 )
 
-func New() Service {
-	// Reuse Connection
-	if dbInstance != nil {
-		return dbInstance
-	}
-	connStr := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable&search_path=%s", username, password, host, port, database, schema)
-	db, err := sql.Open("pgx", connStr)
+type DB struct {
+	sql *sql.DB
+}
+
+// Open connects to Postgres and applies the schema.
+func Open(ctx context.Context, dsn string) (*DB, error) {
+	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	dbInstance = &service{
-		db: db,
-	}
-	return dbInstance
-}
+	sqlDB.SetMaxOpenConns(10)
+	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
+	db := &DB{sql: sqlDB}
 
-// Health checks the health of the database connection by pinging the database.
-// It returns a map with keys indicating various health statistics.
-func (s *service) Health() map[string]string {
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	pingCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+	if err := sqlDB.PingContext(pingCtx); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("connecting to postgres: %w", err)
+	}
+	if err := db.migrate(ctx); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("applying schema: %w", err)
+	}
+	return db, nil
+}
 
-	stats := make(map[string]string)
-
-	// Ping the database
-	err := s.db.PingContext(ctx)
+// migrate applies schema.sql. The server and a scheduled sync can start at the same moment,
+// and concurrent CREATE TABLE IF NOT EXISTS can still collide, hence the lock.
+func (db *DB) migrate(ctx context.Context) error {
+	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", migrateLock); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, schema); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (db *DB) Close() error { return db.sql.Close() }
+
+// Health pings the database and reports pool statistics.
+func (db *DB) Health(ctx context.Context) map[string]string {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	stats := map[string]string{}
+	if err := db.sql.PingContext(ctx); err != nil {
 		stats["status"] = "down"
-		stats["error"] = fmt.Sprintf("db down: %v", err)
-		log.Fatalf("db down: %v", err) // Log the error and terminate the program
+		stats["error"] = err.Error()
 		return stats
 	}
-
-	// Database is up, add more statistics
+	s := db.sql.Stats()
 	stats["status"] = "up"
-	stats["message"] = "It's healthy"
-
-	// Get database stats (like open connections, in use, idle, etc.)
-	dbStats := s.db.Stats()
-	stats["open_connections"] = strconv.Itoa(dbStats.OpenConnections)
-	stats["in_use"] = strconv.Itoa(dbStats.InUse)
-	stats["idle"] = strconv.Itoa(dbStats.Idle)
-	stats["wait_count"] = strconv.FormatInt(dbStats.WaitCount, 10)
-	stats["wait_duration"] = dbStats.WaitDuration.String()
-	stats["max_idle_closed"] = strconv.FormatInt(dbStats.MaxIdleClosed, 10)
-	stats["max_lifetime_closed"] = strconv.FormatInt(dbStats.MaxLifetimeClosed, 10)
-
-	// Evaluate stats to provide a health message
-	if dbStats.OpenConnections > 40 { // Assuming 50 is the max for this example
-		stats["message"] = "The database is experiencing heavy load."
-	}
-
-	if dbStats.WaitCount > 1000 {
-		stats["message"] = "The database has a high number of wait events, indicating potential bottlenecks."
-	}
-
-	if dbStats.MaxIdleClosed > int64(dbStats.OpenConnections)/2 {
-		stats["message"] = "Many idle connections are being closed, consider revising the connection pool settings."
-	}
-
-	if dbStats.MaxLifetimeClosed > int64(dbStats.OpenConnections)/2 {
-		stats["message"] = "Many connections are being closed due to max lifetime, consider increasing max lifetime or revising the connection usage pattern."
-	}
-
+	stats["open_connections"] = strconv.Itoa(s.OpenConnections)
+	stats["in_use"] = strconv.Itoa(s.InUse)
+	stats["idle"] = strconv.Itoa(s.Idle)
 	return stats
 }
 
-// Close closes the database connection.
-// It logs a message indicating the disconnection from the specific database.
-// If the connection is successfully closed, it returns nil.
-// If an error occurs while closing the connection, it returns the error.
-func (s *service) Close() error {
-	log.Printf("Disconnected from database: %s", database)
-	return s.db.Close()
+// TryLock takes a session-level advisory lock without waiting. ok is false if another
+// process holds it. Call unlock when done.
+func (db *DB) TryLock(ctx context.Context, key int64) (unlock func(), ok bool, err error) {
+	conn, err := db.sql.Conn(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := conn.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1)", key).Scan(&ok); err != nil || !ok {
+		conn.Close()
+		return nil, false, err
+	}
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_unlock($1)", key); err != nil {
+			// Couldn't unlock: discard the connection so its session, and the lock, end.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		conn.Close()
+	}, true, nil
+}
+
+func timePtr(t sql.NullTime) *time.Time {
+	if !t.Valid {
+		return nil
+	}
+	v := t.Time
+	return &v
 }

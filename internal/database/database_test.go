@@ -2,99 +2,211 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"log"
+	"os"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
+	"whooper/internal/testpg"
+	"whooper/internal/whoop"
 )
 
-func mustStartPostgresContainer() (func(context.Context, ...testcontainers.TerminateOption) error, error) {
-	var (
-		dbName = "database"
-		dbPwd  = "password"
-		dbUser = "user"
-	)
-
-	dbContainer, err := postgres.Run(
-		context.Background(),
-		"postgres:latest",
-		postgres.WithDatabase(dbName),
-		postgres.WithUsername(dbUser),
-		postgres.WithPassword(dbPwd),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(5*time.Second)),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	database = dbName
-	password = dbPwd
-	username = dbUser
-
-	dbHost, err := dbContainer.Host(context.Background())
-	if err != nil {
-		return dbContainer.Terminate, err
-	}
-
-	dbPort, err := dbContainer.MappedPort(context.Background(), "5432/tcp")
-	if err != nil {
-		return dbContainer.Terminate, err
-	}
-
-	host = dbHost
-	port = dbPort.Port()
-
-	return dbContainer.Terminate, err
-}
+var pg *testpg.Server
 
 func TestMain(m *testing.M) {
-	teardown, err := mustStartPostgresContainer()
+	var err error
+	pg, err = testpg.Start(context.Background())
 	if err != nil {
 		log.Fatalf("could not start postgres container: %v", err)
 	}
-
-	m.Run()
-
-	if teardown != nil && teardown(context.Background()) != nil {
-		log.Fatalf("could not teardown postgres container: %v", err)
-	}
+	code := m.Run()
+	pg.Close()
+	os.Exit(code)
 }
 
-func TestNew(t *testing.T) {
-	srv := New()
-	if srv == nil {
-		t.Fatal("New() returned nil")
+func openTestDB(t *testing.T) (*DB, string) {
+	t.Helper()
+	dsn := pg.NewDatabase(t)
+	db, err := Open(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db, dsn
+}
+
+func TestOpenAppliesSchemaIdempotentlyAndConcurrently(t *testing.T) {
+	_, dsn := openTestDB(t)
+	var wg sync.WaitGroup
+	errs := make(chan error, 4)
+	for range 4 {
+		wg.Go(func() {
+			db, err := Open(context.Background(), dsn)
+			if err == nil {
+				db.Close()
+			}
+			errs <- err
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
 func TestHealth(t *testing.T) {
-	srv := New()
-
-	stats := srv.Health()
-
-	if stats["status"] != "up" {
-		t.Fatalf("expected status to be up, got %s", stats["status"])
+	db, _ := openTestDB(t)
+	if got := db.Health(context.Background())["status"]; got != "up" {
+		t.Fatalf("status = %q", got)
 	}
-
-	if _, ok := stats["error"]; ok {
-		t.Fatalf("expected error not to be present")
-	}
-
-	if stats["message"] != "It's healthy" {
-		t.Fatalf("expected message to be 'It's healthy', got %s", stats["message"])
+	db.Close()
+	if got := db.Health(context.Background())["status"]; got != "down" {
+		t.Fatalf("status after close = %q, want down (and no crash)", got)
 	}
 }
 
-func TestClose(t *testing.T) {
-	srv := New()
-
-	if srv.Close() != nil {
-		t.Fatalf("expected Close() to return nil")
+func TestUpsertRecordsKeepsRawJSONAndUpdates(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	t1 := time.Now().Truncate(time.Microsecond)
+	v1 := json.RawMessage(`{"id":7,"start":"2025-01-01T03:00:00.000Z","end":null,"updated_at":"2025-01-01T03:00:00.000Z","score_state":"PENDING_SCORE","score":null}`)
+	v2 := json.RawMessage(`{"id":7,"start":"2025-01-01T03:00:00.000Z","end":"2025-01-02T02:00:00.000Z","updated_at":"2025-01-02T05:00:00.000Z","score_state":"SCORED","score":{"strain":12.3}}`)
+	if err := db.UpsertRecords(ctx, Cycles, []json.RawMessage{v1}, t1); err != nil {
+		t.Fatal(err)
 	}
+	if err := db.UpsertRecords(ctx, Cycles, []json.RawMessage{v2}, t1.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	var strain float64
+	var state string
+	var first, last time.Time
+	err := db.sql.QueryRow(`SELECT count(*) OVER (), (raw->'score'->>'strain')::float8, score_state, first_seen_at, last_seen_at FROM whoop_cycle`).
+		Scan(&n, &strain, &state, &first, &last)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || strain != 12.3 || state != "SCORED" || !first.Equal(t1) || !last.Equal(t1.Add(time.Hour)) {
+		t.Fatalf("n=%d strain=%v state=%s first=%v last=%v", n, strain, state, first, last)
+	}
+}
+
+func TestUpsertRecordsRejectsMalformedRecord(t *testing.T) {
+	db, _ := openTestDB(t)
+	good := json.RawMessage(`{"id":"00000000-0000-4000-8000-000000000001","start":"2025-01-01T03:00:00.000Z"}`)
+	bad := json.RawMessage(`{"start":"2025-01-01T03:00:00.000Z"}`)
+	if err := db.UpsertRecords(context.Background(), Workouts, []json.RawMessage{good, bad}, time.Now()); err == nil {
+		t.Fatal("expected an error for a record without an id")
+	}
+	if n, _ := db.LiveCount(context.Background(), Workouts); n != 0 {
+		t.Fatalf("page was partially stored: %d rows", n)
+	}
+}
+
+func TestMarkUnseenDeletedAndResurrect(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	rec := func(id string) json.RawMessage {
+		return json.RawMessage(`{"id":"` + id + `","start":"2025-01-01T03:00:00.000Z","sport_name":"running"}`)
+	}
+	a, b := "00000000-0000-4000-8000-00000000000a", "00000000-0000-4000-8000-00000000000b"
+	run1 := time.Now().Truncate(time.Microsecond)
+	if err := db.UpsertRecords(ctx, Workouts, []json.RawMessage{rec(a), rec(b)}, run1); err != nil {
+		t.Fatal(err)
+	}
+	run2 := run1.Add(time.Hour)
+	if err := db.UpsertRecords(ctx, Workouts, []json.RawMessage{rec(a)}, run2); err != nil {
+		t.Fatal(err)
+	}
+	n, err := db.MarkUnseenDeleted(ctx, Workouts, run2)
+	if err != nil || n != 1 {
+		t.Fatalf("marked %d (err %v), want 1", n, err)
+	}
+	stats, _ := db.ResourceStats(ctx, Workouts)
+	if stats.Live != 1 || stats.Deleted != 1 {
+		t.Fatalf("stats = %+v", stats)
+	}
+	if err := db.UpsertRecords(ctx, Workouts, []json.RawMessage{rec(b)}, run2.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if stats, _ := db.ResourceStats(ctx, Workouts); stats.Live != 2 || stats.Deleted != 0 {
+		t.Fatalf("record seen again was not restored: %+v", stats)
+	}
+}
+
+func TestTokenRoundTripAndInfo(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	if info, _ := db.TokenInfo(ctx); info.Connected {
+		t.Fatal("fresh database reports a connected token")
+	}
+	exp := time.Now().Add(time.Hour).Truncate(time.Microsecond)
+	if err := db.SaveToken(ctx, &whoop.Token{AccessToken: "a", RefreshToken: "r", ExpiresAt: exp, Scope: "offline"}); err != nil {
+		t.Fatal(err)
+	}
+	var got *whoop.Token
+	err := db.UpdateToken(ctx, func(cur *whoop.Token) (*whoop.Token, error) { got = cur; return nil, nil })
+	if err != nil || got == nil || got.RefreshToken != "r" || !got.ExpiresAt.Equal(exp) {
+		t.Fatalf("got %+v err %v", got, err)
+	}
+	if info, _ := db.TokenInfo(ctx); !info.Connected || info.Scope != "offline" {
+		t.Fatalf("info = %+v", info)
+	}
+}
+
+func TestOAuthStateIsSingleUse(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	if err := db.CreateOAuthState(ctx, "abcd1234"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := db.ConsumeOAuthState(ctx, "abcd1234"); !ok {
+		t.Fatal("state not accepted")
+	}
+	if ok, _ := db.ConsumeOAuthState(ctx, "abcd1234"); ok {
+		t.Fatal("state accepted twice")
+	}
+	if ok, _ := db.ConsumeOAuthState(ctx, "never-issued"); ok {
+		t.Fatal("unknown state accepted")
+	}
+}
+
+func TestBodyMeasurementOnlyStoresChanges(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	m1 := json.RawMessage(`{"height_meter":1.8,"weight_kilogram":80,"max_heart_rate":190}`)
+	m1reordered := json.RawMessage(`{"max_heart_rate":190,"weight_kilogram":80,"height_meter":1.8}`)
+	m2 := json.RawMessage(`{"height_meter":1.8,"weight_kilogram":79,"max_heart_rate":190}`)
+	for i, c := range []struct {
+		raw  json.RawMessage
+		want bool
+	}{{m1, true}, {m1reordered, false}, {m2, true}, {m2, false}} {
+		got, err := db.RecordBodyMeasurement(ctx, c.raw, time.Now())
+		if err != nil || got != c.want {
+			t.Fatalf("step %d: stored=%v err=%v, want %v", i, got, err, c.want)
+		}
+	}
+}
+
+func TestTryLockExcludesSecondHolder(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	unlock, ok, err := db.TryLock(ctx, SyncLock)
+	if err != nil || !ok {
+		t.Fatalf("first lock: ok=%v err=%v", ok, err)
+	}
+	if _, ok, _ := db.TryLock(ctx, SyncLock); ok {
+		t.Fatal("second holder got the lock")
+	}
+	unlock()
+	unlock2, ok, err := db.TryLock(ctx, SyncLock)
+	if err != nil || !ok {
+		t.Fatalf("lock after unlock: ok=%v err=%v", ok, err)
+	}
+	unlock2()
 }
