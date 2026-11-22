@@ -1,16 +1,19 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.25-alpine AS build
+# Keep in step with the `go` line in go.mod (the image sets GOTOOLCHAIN=local, so an older
+# Go here fails at `go mod download` instead of fetching a newer toolchain).
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/whooper ./cmd/whooper
 
-# Alpine rather than distroless: Dokploy schedules run commands with `docker exec`, and a
-# shell plus wget (for HEALTHCHECK) make that and debugging straightforward.
+# Alpine rather than distroless: Dokploy schedules run `docker exec <container> <shell> -c
+# "<command>"`, with bash as the default shell, so the image needs bash (and wget for
+# HEALTHCHECK).
 FROM alpine:3.22
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache bash ca-certificates tzdata \
     && adduser -D -H -u 10001 whooper
 COPY --from=build /out/whooper /usr/local/bin/whooper
 USER whooper
