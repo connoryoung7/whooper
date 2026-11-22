@@ -2,12 +2,16 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/pressly/goose/v3"
 
 	"whooper/internal/testpg"
 	"whooper/internal/whoop"
@@ -57,6 +61,93 @@ func TestOpenAppliesSchemaIdempotentlyAndConcurrently(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	db, err := Connect(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	assertAllApplied(t, db)
+}
+
+func assertAllApplied(t *testing.T, db *DB) {
+	t.Helper()
+	migrations, err := db.MigrationStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) == 0 {
+		t.Fatal("no migrations found")
+	}
+	for _, m := range migrations {
+		if m.State != goose.StateApplied {
+			t.Errorf("%s is %s", m.Source.Path, m.State)
+		}
+	}
+}
+
+// A database created before goose was introduced (schema applied directly on every start)
+// must be adopted as-is, without losing data.
+func TestMigrationsAdoptPreGooseDatabase(t *testing.T) {
+	ctx := context.Background()
+	dsn := pg.NewDatabase(t)
+	raw, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	initial, err := migrationFiles.ReadFile("migrations/00001_initial_schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upSQL, _, found := strings.Cut(string(initial), "-- +goose Down")
+	if !found {
+		t.Fatal("initial migration has no Down section")
+	}
+	if _, err := raw.ExecContext(ctx, upSQL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx,
+		`INSERT INTO whoop_token (access_token, refresh_token, expires_at) VALUES ('a', 'r', now())`); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("adopting a pre-goose database: %v", err)
+	}
+	defer db.Close()
+	assertAllApplied(t, db)
+	if info, _ := db.TokenInfo(ctx); !info.Connected {
+		t.Fatal("existing data was lost")
+	}
+}
+
+func TestMigrateDownAndUpAgain(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	for {
+		v, err := db.MigrationVersion(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v == 0 {
+			break
+		}
+		if _, err := db.MigrateDown(ctx); err != nil {
+			t.Fatalf("rolling back version %d: %v", v, err)
+		}
+	}
+	var exists bool
+	if err := db.sql.QueryRow(`SELECT to_regclass('whoop_cycle') IS NOT NULL`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("whoop_cycle still exists after rolling back every migration")
+	}
+	if _, err := db.MigrateUp(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertAllApplied(t, db)
 }
 
 func TestHealth(t *testing.T) {

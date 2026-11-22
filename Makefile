@@ -20,6 +20,14 @@ sync:
 # Print the data completeness report
 status:
 	@go run ./cmd/whooper status
+
+# Create a new database migration: make migration name=add_something
+# (uses the goose version pinned in go.mod; migrations apply automatically on startup)
+GOOSE_VERSION = $(shell go list -m -f '{{.Version}}' github.com/pressly/goose/v3)
+migration:
+	@test -n "$(name)" || (echo "usage: make migration name=<snake_case_name>" && exit 1)
+	@go run github.com/pressly/goose/v3/cmd/goose@$(GOOSE_VERSION) -dir internal/database/migrations -s create $(name) sql
+
 # Create DB container
 docker-run:
 	@if docker compose up --build 2>/dev/null; then \
@@ -69,4 +77,4 @@ watch:
             fi; \
         fi
 
-.PHONY: all build run sync status test clean watch docker-run docker-down itest
+.PHONY: all build run sync status migration test clean watch docker-run docker-down itest

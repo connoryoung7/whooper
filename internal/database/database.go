@@ -5,30 +5,41 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	_ "embed"
 	"fmt"
+	"log"
 	"strconv"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-//go:embed schema.sql
-var schema string
-
-// Advisory lock keys. The values are arbitrary but fixed so every process agrees on them.
-const (
-	migrateLock int64 = 7_305_942_001
-	// SyncLock is held for a whole sync run so scheduled runs never overlap.
-	SyncLock int64 = 7_305_942_002
-)
+// SyncLock is the advisory lock key held for a whole sync run so scheduled runs never
+// overlap. The value is arbitrary but fixed so every process agrees on it.
+const SyncLock int64 = 7_305_942_002
 
 type DB struct {
 	sql *sql.DB
 }
 
-// Open connects to Postgres and applies the schema.
+// Open connects to Postgres and applies any pending migrations.
 func Open(ctx context.Context, dsn string) (*DB, error) {
+	db, err := Connect(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	results, err := db.MigrateUp(ctx)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("applying migrations: %w", err)
+	}
+	for _, r := range results {
+		log.Printf("applied migration %s (%s)", r.Source.Path, r.Duration.Round(time.Millisecond))
+	}
+	return db, nil
+}
+
+// Connect connects to Postgres without touching the schema (see Open).
+func Connect(ctx context.Context, dsn string) (*DB, error) {
 	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, err
@@ -43,28 +54,7 @@ func Open(ctx context.Context, dsn string) (*DB, error) {
 		sqlDB.Close()
 		return nil, fmt.Errorf("connecting to postgres: %w", err)
 	}
-	if err := db.migrate(ctx); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("applying schema: %w", err)
-	}
 	return db, nil
-}
-
-// migrate applies schema.sql. The server and a scheduled sync can start at the same moment,
-// and concurrent CREATE TABLE IF NOT EXISTS can still collide, hence the lock.
-func (db *DB) migrate(ctx context.Context) error {
-	tx, err := db.sql.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", migrateLock); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, schema); err != nil {
-		return err
-	}
-	return tx.Commit()
 }
 
 func (db *DB) Close() error { return db.sql.Close() }

@@ -1,5 +1,10 @@
--- Applied on every start (under an advisory lock), so every statement must be idempotent.
+-- Initial schema.
+--
+-- The IF NOT EXISTS clauses let goose adopt a database created before migrations existed
+-- (when this schema was applied on every start): this migration becomes a no-op there and
+-- the database is simply recorded as being at version 1. Later migrations don't need them.
 
+-- +goose Up
 -- The single WHOOP OAuth token pair. Refresh tokens rotate, so this row changes on every refresh.
 CREATE TABLE IF NOT EXISTS whoop_token (
     id            smallint    PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -109,3 +114,15 @@ CREATE TABLE IF NOT EXISTS whoop_sync_run (
     requests    integer,
     error       text
 );
+
+-- +goose Down
+DROP TABLE IF EXISTS whoop_sync_run;
+DROP TABLE IF EXISTS whoop_sync_state;
+DROP TABLE IF EXISTS whoop_workout;
+DROP TABLE IF EXISTS whoop_recovery;
+DROP TABLE IF EXISTS whoop_sleep;
+DROP TABLE IF EXISTS whoop_cycle;
+DROP TABLE IF EXISTS whoop_body_measurement;
+DROP TABLE IF EXISTS whoop_profile;
+DROP TABLE IF EXISTS whoop_oauth_state;
+DROP TABLE IF EXISTS whoop_token;

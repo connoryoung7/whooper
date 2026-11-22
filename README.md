@@ -4,13 +4,14 @@ Mirrors your entire WHOOP history (cycles, sleeps, recoveries, workouts, profile
 measurements) into Postgres via the WHOOP Developer API v2, keeps it up to date on a
 schedule, and tells you whether the copy is complete.
 
-One binary, three commands:
+One binary, four commands:
 
 | Command | What it does |
 | --- | --- |
 | `whooper serve` | Web server: WHOOP connect flow (`/auth/login`), completeness report (`/status`), `/health`. Default container command. |
 | `whooper sync [--full]` | One sync pass, then exits. Run this on a schedule. |
 | `whooper status [--json]` | Prints the completeness report; exits 1 if the history is incomplete. |
+| `whooper migrate [status\|up\|down]` | Lists applied schema migrations (default), applies pending ones, or rolls back the newest. |
 
 ## How "all of my data, all time" is guaranteed
 
@@ -105,6 +106,28 @@ make sync                 # or: make sync FULL=1
 make status
 make test                 # integration tests need Docker (testcontainers)
 ```
+
+## Database migrations
+
+The schema is managed with [goose](https://github.com/pressly/goose). Migrations are
+numbered SQL files in `internal/database/migrations/`, built into the binary. Every command
+applies pending migrations when it starts, so deploying a new version is enough. A
+Postgres advisory lock makes a web server and a scheduled sync that start together take
+turns. Applied versions are recorded in the `goose_db_version` table.
+
+To change the schema:
+
+```bash
+make migration name=add_workout_zone_columns   # creates internal/database/migrations/00002_….sql
+```
+
+Write the `-- +goose Up` and `-- +goose Down` sections. `make itest` runs the migrations
+against a real Postgres. Never edit a migration that has already been deployed; add a new
+one instead.
+
+On the server, `whooper migrate status` lists what's applied (run it from the Dokploy
+terminal). `whooper migrate down` rolls back the newest migration. It refuses to roll back
+`00001`, because that would drop every table.
 
 ## Data model
 

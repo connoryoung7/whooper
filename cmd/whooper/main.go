@@ -3,6 +3,7 @@
 //	whooper serve          web server: WHOOP OAuth connect flow, /status, /health
 //	whooper sync [--full]  one sync pass, then exit (run this on a schedule)
 //	whooper status         completeness report; exits 1 if the history is incomplete
+//	whooper migrate [status|up|down]  inspect or change the schema version
 package main
 
 import (
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/pressly/goose/v3"
 
 	"whooper/internal/config"
 	"whooper/internal/database"
@@ -49,6 +51,8 @@ func main() {
 		err = runSync(ctx, args)
 	case "status":
 		err = status(ctx, args)
+	case "migrate":
+		err = migrate(ctx, args)
 	case "help", "-h", "--help":
 		usage(os.Stdout)
 		return
@@ -76,6 +80,9 @@ commands:
   serve          run the web server (WHOOP connect flow at /auth/login, report at /status)
   sync [--full]  sync once and exit; --full re-downloads the entire history
   status         print the completeness report; exit status 1 if incomplete
+  migrate [status|up|down]
+                 show applied migrations (default), apply pending ones, or roll back
+                 the newest one (every command already applies pending migrations)
 `)
 }
 
@@ -207,6 +214,66 @@ func status(ctx context.Context, args []string) error {
 	}
 	if !rep.Complete {
 		return errIncomplete
+	}
+	return nil
+}
+
+func migrate(ctx context.Context, args []string) error {
+	sub := "status"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	db, err := database.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	switch sub {
+	case "status":
+		migrations, err := db.MigrationStatus(ctx)
+		if err != nil {
+			return err
+		}
+		for _, m := range migrations {
+			state := "pending"
+			if m.State == goose.StateApplied {
+				// goose stores this as a timestamp without time zone, in the database
+				// server's local time, so don't claim a zone for it.
+				state = "applied " + m.AppliedAt.Format("2006-01-02 15:04") + " (database server time)"
+			}
+			fmt.Printf("%-45s %s\n", m.Source.Path, state)
+		}
+	case "up":
+		results, err := db.MigrateUp(ctx)
+		for _, r := range results {
+			fmt.Printf("applied %s (%s)\n", r.Source.Path, r.Duration.Round(time.Millisecond))
+		}
+		if err != nil {
+			return err
+		}
+		if len(results) == 0 {
+			fmt.Println("no pending migrations")
+		}
+	case "down":
+		v, err := db.MigrationVersion(ctx)
+		if err != nil {
+			return err
+		}
+		if v <= 1 {
+			return errors.New("refusing to roll back the initial schema: it would drop every table, including the WHOOP token")
+		}
+		r, err := db.MigrateDown(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("rolled back %s\n", r.Source.Path)
+	default:
+		return fmt.Errorf("unknown migrate command %q (want status, up or down)", sub)
 	}
 	return nil
 }
