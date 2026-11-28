@@ -1,3 +1,20 @@
+# Full local stack: Postgres, the web server, and the scheduled syncs.
+# Settings come from .env (copy .env.example). BLUEPRINT_DB_HOST/PORT are overridden below
+# so the app containers reach Postgres by its service name rather than localhost.
+
+x-whooper: &whooper
+  build: .
+  image: whooper:local
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    BLUEPRINT_DB_HOST: psql_bp
+    BLUEPRINT_DB_PORT: "5432"
+    TZ: ${TZ:-UTC}
+  depends_on:
+    psql_bp:
+      condition: service_healthy
+
 services:
   psql_bp:
     image: postgres:latest
@@ -10,6 +27,41 @@ services:
       - "${BLUEPRINT_DB_PORT}:5432"
     volumes:
       - psql_volume_bp:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # whooper serve: WHOOP connect flow (/auth/login), /status, /health.
+  api:
+    <<: *whooper
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      BLUEPRINT_DB_HOST: psql_bp
+      BLUEPRINT_DB_PORT: "5432"
+      TZ: ${TZ:-UTC}
+      PORT: "8080"
+
+  # The same schedules the README sets up as Dokploy schedules. busybox crond runs as root
+  # so it can switch to the unprivileged whooper user for each job; the jobs inherit the
+  # container's environment and log to its output. Overlapping runs are safe: a sync that
+  # finds another one holding the advisory lock skips itself.
+  cron:
+    <<: *whooper
+    user: root
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        : > /etc/crontabs/root
+        printf '%s\n' \
+          '0 * * * * whooper sync' \
+          '30 3 * * * whooper sync --full' \
+          > /etc/crontabs/whooper
+        exec crond -f -l 8
+    healthcheck:
+      disable: true
 
 volumes:
   psql_volume_bp:

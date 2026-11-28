@@ -138,11 +138,24 @@ exits 1 if anything is missing. You can also add it as a daily schedule.
 
 ```bash
 cp .env.example .env      # fill in WHOOP_CLIENT_ID / SECRET / ADMIN_PASSWORD
-make docker-run           # Postgres from docker-compose.yml
+make docker-run           # Postgres + api + cron from docker-compose.yml
+                          # → http://localhost:8080/auth/login
+make test                 # integration tests need Docker (testcontainers)
+```
+
+`docker-compose.yml` runs three services: `psql_bp` (Postgres), `api` (`whooper serve`),
+and `cron`, which runs `whooper sync` hourly and `whooper sync --full` at 03:30, the same
+schedules as in Dokploy. Cron times use `TZ` from `.env` (default UTC). Follow the syncs
+with `docker compose logs -f cron`, and run one by hand with
+`docker compose exec api whooper sync`.
+
+To run the Go code directly instead, start only the database and use the make targets:
+
+```bash
+docker compose up -d psql_bp
 make run                  # whooper serve → http://localhost:8080/auth/login
 make sync                 # or: make sync FULL=1
 make status
-make test                 # integration tests need Docker (testcontainers)
 ```
 
 ## Database migrations

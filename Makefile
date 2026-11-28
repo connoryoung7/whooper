@@ -28,7 +28,7 @@ migration:
 	@test -n "$(name)" || (echo "usage: make migration name=<snake_case_name>" && exit 1)
 	@go run github.com/pressly/goose/v3/cmd/goose@$(GOOSE_VERSION) -dir internal/database/migrations -s create $(name) sql
 
-# Create DB container
+# Build and run the full stack (Postgres, api, cron)
 docker-run:
 	@if docker compose up --build 2>/dev/null; then \
 		: ; \
@@ -37,7 +37,7 @@ docker-run:
 		docker-compose up --build; \
 	fi
 
-# Shutdown DB container
+# Shut down the stack
 docker-down:
 	@if docker compose down 2>/dev/null; then \
 		: ; \
