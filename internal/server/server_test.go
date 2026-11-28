@@ -131,6 +131,22 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+func TestHealthDownHidesDatabaseError(t *testing.T) {
+	e := newEnv(t)
+	e.db.Close()
+	resp := e.get(t, "/health", false)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("health with database closed = %d, want 503", resp.StatusCode)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]string{"status": "down"}; len(body) != 1 || body["status"] != "down" {
+		t.Fatalf("body = %v, want %v", body, want)
+	}
+}
+
 func TestConnectFlowStoresTokenAndStartsBackfill(t *testing.T) {
 	e := newEnv(t)
 	state := e.login(t)

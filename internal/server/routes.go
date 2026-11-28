@@ -51,6 +51,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if stats["status"] != "up" {
 		status = http.StatusServiceUnavailable
 	}
+	// /health is public, and driver errors name the database user, host and address.
+	// Log the reason here and send clients only the status.
+	if msg, ok := stats["error"]; ok {
+		s.logf("health: database down: %s", msg)
+		delete(stats, "error")
+	}
 	writeJSON(w, status, stats)
 }
 
